@@ -215,7 +215,9 @@ def main() -> None:
     application.add_handler(start_handler)
     application.add_handler(image_handler)
     
-    print("Bot started successfully! Waiting for messages...")
+        print("Bot started successfully! Waiting for messages...")
+    # Run the bot
+    application.run_polling()
     
     # Run the bot
     application.run_polling()
