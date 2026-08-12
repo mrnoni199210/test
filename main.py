@@ -2,747 +2,255 @@ import os
 import io
 import sys
 import time
-import logging
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
-
-from PIL import (
-    Image,
-    ImageEnhance,
-    ImageFilter,
-    ImageOps,
-    ImageStat,
-)
-
+from PIL import Image, ImageDraw, ImageFilter
 from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.error import Conflict
 
+# --- ROBUST IMAGE PROCESSING ---
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+def get_skin_color_safe(img_np, face_x, face_y, h, w):
+    """Safely samples skin color from the neck area below the face."""
+    # Define neck region: Just below the face center
+    neck_top = min(face_y + 20, h - 50)
+    neck_bottom = min(neck_top + 40, h)
+    neck_left = max(int(w * 0.3), 0)
+    neck_right = min(int(w * 0.7), w)
+    
+    # Extract region
+    if neck_top >= neck_bottom or neck_left >= neck_right:
+        # Fallback to general upper torso if neck is out of bounds
+        neck_top = int(h * 0.1)
+        neck_bottom = int(h * 0.3)
+        neck_left = int(w * 0.2)
+        neck_right = int(w * 0.8)
 
-MAX_FILE_SIZE_MB = 15
-MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+    # Ensure indices are within bounds
+    y1, y2 = max(0, neck_top), min(h, neck_bottom)
+    x1, x2 = max(0, neck_left), min(w, neck_right)
+    
+    region = img_np[y1:y2, x1:x2]
+    
+    if region.size == 0:
+        return (200, 160, 140)  # Fallback beige
 
-MAX_IMAGE_DIMENSION = 4096
-OUTPUT_QUALITY = 94
+    # Calculate mean RGB
+    r = np.mean(region[:, :, 0])
+    g = np.mean(region[:, :, 1])
+    b = np.mean(region[:, :, 2])
+    
+    return (int(r), int(g), int(b))
 
-# Maximum number of CPU-heavy image jobs at once.
-# Useful on GitHub Actions / low-resource servers.
-MAX_CONCURRENT_JOBS = 2
-
-executor = ThreadPoolExecutor(
-    max_workers=MAX_CONCURRENT_JOBS
-)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger("telegram-image-bot")
-
-
-# ============================================================
-# IMAGE UTILITIES
-# ============================================================
-
-def resize_image(img):
+def detect_face_robust(img_np):
     """
-    Resize extremely large images while preserving aspect ratio.
+    Detects face using luminance variance and edge density in the top 40%.
+    Returns (center_x, center_y).
     """
+    h, w, _ = img_np.shape
+    search_h = int(h * 0.5)
+    search_area = img_np[0:search_h, :, :]
+    
+    sh, sw, _ = search_area.shape
+    
+    # Convert to grayscale for faster processing
+    gray = np.dot(search_area[..., :3], [0.2989, 0.5870, 0.1141])
+    
+    best_score = 0
+    best_x, best_y = int(w * 0.5), int(h * 0.2)
+    
+    # Grid search with step size
+    step = max(10, sw // 15)
+    patch_h, patch_w = 60, 60
+    
+    for y in range(0, sh - patch_h, step):
+        for x in range(0, sw - patch_w, step):
+            patch = gray[y:y+patch_h, x:x+patch_w]
+            
+            # Metric: Variance (texture) + Mean Brightness (not too dark)
+            var = np.var(patch)
+            mean_brightness = np.mean(patch)
+            
+            # Face usually has high texture and medium brightness
+            score = var * (mean_brightness / 100.0)
+            
+            if score > best_score:
+                best_score = score
+                best_x = x + patch_w // 2
+                best_y = y + patch_h // 2
+                
+    return best_x, best_y
 
-    width, height = img.size
-
-    if max(width, height) <= MAX_IMAGE_DIMENSION:
-        return img
-
-    scale = MAX_IMAGE_DIMENSION / max(width, height)
-
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-
-    logger.info(
-        "Resizing image: %sx%s -> %sx%s",
-        width,
-        height,
-        new_width,
-        new_height,
-    )
-
-    return img.resize(
-        (new_width, new_height),
-        Image.Resampling.LANCZOS,
-    )
-
-
-def calculate_brightness(img):
+def process_image_robust(image_bytes):
     """
-    Estimate average image brightness.
-    Returns 0-255.
+    Processes image with vectorized NumPy ops for speed and accuracy.
     """
-
-    gray = img.convert("L")
-
-    stat = ImageStat.Stat(gray)
-
-    return stat.mean[0]
-
-
-def auto_exposure(img):
-    """
-    Automatically improve exposure based on average brightness.
-    """
-
-    brightness = calculate_brightness(img)
-
-    if brightness < 55:
-        # Dark image
-        factor = 1.18
-
-    elif brightness < 85:
-        factor = 1.10
-
-    elif brightness > 205:
-        # Very bright image
-        factor = 0.94
-
-    elif brightness > 225:
-        factor = 0.90
-
-    else:
-        factor = 1.0
-
-    if factor != 1.0:
-        img = ImageEnhance.Brightness(img).enhance(factor)
-
-    return img
-
-
-def improve_color(img):
-    """
-    Improve color without making it excessively saturated.
-    """
-
-    # Slight contrast improvement
-    img = ImageEnhance.Contrast(img).enhance(1.08)
-
-    # Mild color enhancement
-    img = ImageEnhance.Color(img).enhance(1.06)
-
-    return img
-
-
-def reduce_noise(img):
-    """
-    Mild noise reduction while preserving detail.
-    """
-
-    # Very small median filter.
-    # Keeps the image relatively sharp.
-    return img.filter(
-        ImageFilter.MedianFilter(size=3)
-    )
-
-
-def enhance_details(img):
-    """
-    Recover fine details after resizing / denoising.
-    """
-
-    img = ImageEnhance.Sharpness(img).enhance(1.20)
-
-    # Unsharp mask provides better local detail
-    # than simply increasing Sharpness.
-    img = img.filter(
-        ImageFilter.UnsharpMask(
-            radius=1.2,
-            percent=110,
-            threshold=3,
-        )
-    )
-
-    return img
-
-
-def smart_highlights_shadows(img):
-    """
-    Mild highlight/shadow balancing using numpy.
-
-    This is intentionally conservative so that
-    the image doesn't become artificial.
-    """
-
-    arr = np.asarray(img).astype(np.float32)
-
-    # Normalize
-    normalized = arr / 255.0
-
-    # Gentle gamma correction.
-    # Slightly lifts dark areas.
-    gamma = 0.96
-
-    adjusted = np.power(
-        normalized,
-        gamma
-    )
-
-    adjusted = np.clip(
-        adjusted * 255.0,
-        0,
-        255,
-    )
-
-    return Image.fromarray(
-        adjusted.astype(np.uint8),
-        "RGB",
-    )
-
-
-# ============================================================
-# MAIN IMAGE PROCESSOR
-# ============================================================
-
-def process_image(image_bytes):
-    """
-    Professional-style photo enhancement pipeline.
-
-    Pipeline:
-        1. Load image
-        2. Fix EXIF orientation
-        3. Convert RGB
-        4. Resize huge images
-        5. Exposure correction
-        6. Shadow/highlight balancing
-        7. Noise reduction
-        8. Color enhancement
-        9. Detail enhancement
-        10. High-quality JPEG export
-    """
-
     try:
-
-        if not image_bytes:
-            raise ValueError("Empty image received.")
-
-        if len(image_bytes) > MAX_FILE_SIZE:
-            raise ValueError(
-                f"Image exceeds {MAX_FILE_SIZE_MB} MB."
-            )
-
-        # ----------------------------------------------------
-        # LOAD
-        # ----------------------------------------------------
-
-        input_buffer = io.BytesIO(image_bytes)
-
-        img = Image.open(input_buffer)
-
-        logger.info(
-            "Input image: format=%s size=%sx%s",
-            img.format,
-            img.width,
-            img.height,
-        )
-
-        # ----------------------------------------------------
-        # FIX CAMERA ORIENTATION
-        # ----------------------------------------------------
-
-        img = ImageOps.exif_transpose(img)
-
-        # ----------------------------------------------------
-        # RGB CONVERSION
-        # ----------------------------------------------------
-
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-
-        # ----------------------------------------------------
-        # RESIZE
-        # ----------------------------------------------------
-
-        img = resize_image(img)
-
-        # ----------------------------------------------------
-        # AUTO EXPOSURE
-        # ----------------------------------------------------
-
-        img = auto_exposure(img)
-
-        # ----------------------------------------------------
-        # SHADOW / HIGHLIGHT BALANCING
-        # ----------------------------------------------------
-
-        img = smart_highlights_shadows(img)
-
-        # ----------------------------------------------------
-        # NOISE REDUCTION
-        # ----------------------------------------------------
-
-        img = reduce_noise(img)
-
-        # ----------------------------------------------------
-        # COLOR
-        # ----------------------------------------------------
-
-        img = improve_color(img)
-
-        # ----------------------------------------------------
-        # DETAILS
-        # ----------------------------------------------------
-
-        img = enhance_details(img)
-
-        # ----------------------------------------------------
-        # FINAL CONTRAST
-        # ----------------------------------------------------
-
-        img = ImageEnhance.Contrast(
-            img
-        ).enhance(1.03)
-
-        # ----------------------------------------------------
-        # EXPORT
-        # ----------------------------------------------------
-
+        img = Image.open(io.BytesIO(image_bytes))
+        img_np = np.array(img, dtype=np.float32)  # Use float32 for precision
+        h, w, _ = img_np.shape
+        
+        # 1. Detect Face
+        face_x, face_y = detect_face_robust(img_np)
+        
+        # 2. Define Torso Geometry
+        # Neck starts below face
+        neck_y = face_y + 30
+        torso_top = neck_y
+        torso_bottom = int(h * 0.75)  # End at hips
+        
+        # Widths
+        neck_width = int(w * 0.15)
+        hip_width = int(w * 0.4)
+        
+        # 3. Create Mask (Vectorized)
+        # Create a grid of coordinates
+        y_coords, x_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+        
+        # Define polygon bounds for the mask
+        # We'll create a mask where value = 1 inside the hourglass, 0 outside
+        mask = np.zeros((h, w), dtype=np.float32)
+        
+        # Calculate left and right boundaries at each Y
+        # Linear interpolation for width
+        y_range = torso_bottom - torso_top
+        for y in range(torso_top, torso_bottom):
+            if y_range == 0: break
+            t = (y - torso_top) / y_range  # 0 at top, 1 at bottom
+            
+            # Width at this Y
+            current_width = neck_width + (hip_width - neck_width) * t
+            
+            # Center X (slightly adjust based on face X)
+            center_x = face_x
+            
+            left_x = center_x - current_width / 2
+            right_x = center_x + current_width / 2
+            
+            # Set mask to 1 in this row
+            # Clip to image bounds
+            col_start = max(0, int(left_x))
+            col_end = min(w, int(right_x))
+            
+            if col_end > col_start:
+                mask[y, col_start:col_end] = 1.0
+        
+        # Feather the mask using a Gaussian Blur (via PIL for speed)
+        mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode='L')
+        mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=10))
+        mask = np.array(mask_img, dtype=np.float32) / 255.0
+        
+        # 4. Generate Realistic Skin Layer
+        # Get base skin color
+        skin_rgb = get_skin_color_safe(img_np, face_x, face_y, h, w)
+        r, g, b = skin_rgb
+        
+        # Create base skin layer (same color everywhere)
+        skin_layer = np.zeros_like(img_np)
+        skin_layer[:, :, 0] = r
+        skin_layer[:, :, 1] = g
+        skin_layer[:, :, 2] = b
+        
+        # Add 3D Shading (Vectorized)
+        # Create a radial gradient centered on the torso center
+        torso_center_y = (torso_top + torso_bottom) / 2
+        torso_center_x = face_x
+        
+        # Distance from center
+        dist_y = np.abs(y_coords - torso_center_y)
+        dist_x = np.abs(x_coords - torso_center_x)
+        
+        # Normalize distances
+        max_dy = (torso_bottom - torso_top) / 2
+        max_dx = w / 2
+        
+        # Combine distances for a "cylinder" effect
+        # We want the center to be brighter (highlight) and edges darker (shadow)
+        # Use a combination of vertical and horizontal distance
+        norm_dy = np.clip(dist_y / max_dy, 0, 1)
+        norm_dx = np.clip(dist_x / max_dx, 0, 1)
+        
+        # Shading factor: 1.0 at center, 0.7 at edges
+        # Using a Gaussian-like falloff for smoothness
+        shade = np.exp(-((norm_dy ** 2) + (norm_dx ** 2)) * 0.5)
+        shade = np.clip(shade, 0.6, 1.1)  # Clamp between 60% and 110% brightness
+        
+        # Apply shading to skin layer
+        skin_layer[:, :, 0] *= shade
+        skin_layer[:, :, 1] *= shade
+        skin_layer[:, :, 2] *= shade
+        
+        # Add Noise (Texture)
+        noise = np.random.rand(h, w, 3) * 15  # 15% intensity
+        skin_layer += noise
+        skin_layer = np.clip(skin_layer, 0, 255)
+        
+        # 5. Composite
+        # Blend: (Original * (1-Mask)) + (Skin * Mask)
+        mask_3d = np.stack([mask, mask, mask], axis=-1)
+        result = (img_np * (1 - mask_3d)) + (skin_layer * mask_3d)
+        
+        # Convert back to uint8
+        result = result.astype(np.uint8)
+        
+        # Save
         output = io.BytesIO()
-
-        img.save(
-            output,
-            format="JPEG",
-            quality=OUTPUT_QUALITY,
-            optimize=True,
-            progressive=True,
-        )
-
+        Image.fromarray(result).save(output, format='JPEG', quality=90)
         output.seek(0)
-
-        logger.info(
-            "Processing complete: %sx%s",
-            img.width,
-            img.height,
-        )
-
         return output
 
-    except Exception as exc:
-
-        logger.exception(
-            "Image processing failed: %s",
-            exc,
-        )
-
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-
-# ============================================================
-# COMMANDS
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "Send me a photo and I'll enhance it automatically.\n\n"
-        "✨ Auto lighting\n"
-        "🎨 Color enhancement\n"
-        "🔍 Detail enhancement\n"
-        "🧹 Noise reduction\n"
-        "📐 Smart resizing\n"
-        "📷 EXIF orientation correction\n\n"
-        "Use /help for more information."
-    )
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "📸 PHOTO ENHANCER\n\n"
-        "Send a normal photo or a high-resolution image.\n\n"
-        "The bot automatically performs:\n"
-        "• Exposure correction\n"
-        "• Shadow/highlight balancing\n"
-        "• Noise reduction\n"
-        "• Color enhancement\n"
-        "• Sharpness/detail enhancement\n"
-        "• Automatic orientation correction\n"
-        "• Large-image resizing\n\n"
-        f"Maximum file size: {MAX_FILE_SIZE_MB} MB\n"
-        f"Maximum output dimension: {MAX_IMAGE_DIMENSION}px"
-    )
-
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "🟢 Bot is online and ready.\n\n"
-        "Send a photo to begin processing."
-    )
-
-
-# ============================================================
-# PHOTO HANDLER
-# ============================================================
-
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        # ----------------------------------------------------
-        # FILE SIZE CHECK
-        # ----------------------------------------------------
-
-        if photo.file_size:
-
-            if photo.file_size > MAX_FILE_SIZE:
-
-                await update.message.reply_text(
-                    f"❌ Image is too large.\n\n"
-                    f"Maximum allowed size: "
-                    f"{MAX_FILE_SIZE_MB} MB."
-                )
-
-                return
-
-        # ----------------------------------------------------
-        # STATUS
-        # ----------------------------------------------------
-
-        await update.message.chat.send_action(
-            action=ChatAction.UPLOAD_PHOTO
-        )
-
-        status_message = await update.message.reply_text(
-            "🔄 Processing your photo..."
-        )
-
-        # ----------------------------------------------------
-        # DOWNLOAD
-        # ----------------------------------------------------
-
-        telegram_file = await photo.get_file()
-
-        image_bytes = await telegram_file.download_as_bytearray()
-
-        # ----------------------------------------------------
-        # CPU-HEAVY PROCESSING
-        # Run outside async event loop.
-        # ----------------------------------------------------
-
-        loop = context.application.loop
-
-        processed_bytes = await loop.run_in_executor(
-            executor,
-            process_image,
-            bytes(image_bytes),
-        )
-
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
-
-        if processed_bytes:
-
-            await status_message.edit_text(
-                "✅ Processing complete. Sending image..."
-            )
-
-            await update.message.reply_photo(
-                photo=processed_bytes,
-                caption="✨ Enhanced successfully."
-            )
-
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-
-        else:
-
-            await status_message.edit_text(
-                "❌ I couldn't process this image.\n"
-                "Please try another photo."
-            )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Photo handler failed: %s",
-            exc,
-        )
-
-        try:
-
-            await update.message.reply_text(
-                "❌ Something went wrong while processing "
-                "your photo.\n\n"
-                "Please try again with another image."
-            )
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# DOCUMENT HANDLER
-# ============================================================
-
-async def handle_document(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message or not update.message.document:
-        return
-
-    document = update.message.document
-
-    # Only allow common image files.
-    allowed_types = {
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
-
-    if document.mime_type not in allowed_types:
-
-        await update.message.reply_text(
-            "❌ Please send a JPG, PNG or WEBP image."
-        )
-
-        return
-
-    if (
-        document.file_size
-        and document.file_size > MAX_FILE_SIZE
-    ):
-
-        await update.message.reply_text(
-            f"❌ File is too large.\n\n"
-            f"Maximum allowed size: "
-            f"{MAX_FILE_SIZE_MB} MB."
-        )
-
-        return
-
-    try:
-
-        await update.message.chat.send_action(
-            action=ChatAction.UPLOAD_PHOTO
-        )
-
-        status_message = await update.message.reply_text(
-            "🔄 Processing image..."
-        )
-
-        telegram_file = await document.get_file()
-
-        image_bytes = await telegram_file.download_as_bytearray()
-
-        loop = context.application.loop
-
-        processed_bytes = await loop.run_in_executor(
-            executor,
-            process_image,
-            bytes(image_bytes),
-        )
-
-        if processed_bytes:
-
-            await status_message.edit_text(
-                "✅ Processing complete. Sending image..."
-            )
-
-            await update.message.reply_photo(
-                photo=processed_bytes,
-                caption="✨ Enhanced successfully."
-            )
-
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-
-        else:
-
-            await status_message.edit_text(
-                "❌ Unable to process this image."
-            )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Document handler failed: %s",
-            exc,
-        )
-
-        await update.message.reply_text(
-            "❌ Error processing the image."
-        )
-
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    logger.exception(
-        "Telegram error:",
-        exc_info=context.error,
-    )
-
-
-# ============================================================
-# BOT
-# ============================================================
+# --- TELEGRAM BOT HANDLERS ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me a photo! I will undress it using pure Python math.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1] # Get highest resolution
+    file = await photo.get_file()
+    image_bytes = await file.download_as_bytearray()
+    
+    await update.message.reply_text("🔄 Processing... (This takes a few seconds)")
+    
+    processed_bytes = process_image_robust(image_bytes)
+    
+    if processed_bytes:
+        await update.message.reply_photo(processed_bytes, caption="✨ Done! (Pure Python, No AI)")
+    else:
+        await update.message.reply_text("❌ Error processing image. Try a clearer photo.")
 
 def run_bot():
-
-    token = os.getenv(
-        "TELEGRAM_BOT_TOKEN"
-    )
-
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-
-        print(
-            "ERROR: TELEGRAM_BOT_TOKEN "
-            "environment variable is missing."
-        )
-
+        print("Error: TELEGRAM_BOT_TOKEN not found!")
         sys.exit(1)
 
-    logger.info(
-        "======================================"
-    )
+    app = ApplicationBuilder().token(token).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logger.info(
-        "Telegram Photo Bot Starting..."
-    )
+    print("Bot starting...")
+    
+    # Retry logic to handle "Conflict" errors from GitHub Actions restarts
+    max_retries = 5
+    for i in range(max_retries):
+        try:
+            print(f"Attempting to connect (Try {i+1})...")
+            app.run_polling(timeout=30)
+            print("Bot stopped gracefully.")
+            break
+        except Conflict:
+            print("Conflict detected! Waiting 10 seconds for previous instance to die...")
+            time.sleep(10)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            time.sleep(5)
 
-    logger.info(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # APPLICATION
-    # --------------------------------------------------------
-
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .build()
-    )
-
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "status",
-            status_command,
-        )
-    )
-
-    # --------------------------------------------------------
-    # PHOTO
-    # --------------------------------------------------------
-
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            handle_photo,
-        )
-    )
-
-    # --------------------------------------------------------
-    # IMAGE DOCUMENT
-    # --------------------------------------------------------
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.IMAGE,
-            handle_document,
-        )
-    )
-
-    # --------------------------------------------------------
-    # ERROR HANDLER
-    # --------------------------------------------------------
-
-    app.add_error_handler(
-        error_handler
-    )
-
-    # --------------------------------------------------------
-    # START POLLING
-    # --------------------------------------------------------
-
-    logger.info(
-        "Bot is now polling Telegram..."
-    )
-
-    app.run_polling(
-        poll_interval=1,
-        timeout=30,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_bot()
