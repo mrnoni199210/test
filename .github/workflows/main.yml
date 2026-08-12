@@ -3,21 +3,23 @@ name: Run Telegram Bot
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:  # Ye line "Run Workflow" button dalati hai
   schedule:
-    # Run every 55 minutes to keep it alive (free tier limit is 60 mins)
-    - cron: '55 * * * *'
+    # Har 50 minute baad restart karega taaki 60 min limit se pehle update ho jaye
+    - cron: '*/50 * * * *'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
