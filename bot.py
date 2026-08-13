@@ -1,80 +1,117 @@
-import requests
-import base64
 import os
+import requests
+import telebot
+from telebot import types
+import base64
 
-# 1. PASTE YOUR API KEY HERE
-API_KEY = "sk-b6a8c4d7fe883e27726a83099867ae220d02828df04354b0"  # Replace with the key from your screenshot
+# --- CONFIGURATION ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+NSFW_API_KEY = os.getenv("NSFWROUTER_API_KEY")
+# Base URL: Usually just the domain without /console
+BASE_URL = "https://nsfwrouter.xyz/api/v1" 
 
-# 2. SET THE BASE URL
-# Usually it's just the domain + /api/v1
-BASE_URL = "https://nothrotting.xyz/api/v1" # Adjust if the domain is different
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# 3. Prepare the Image
-image_path = "reference.jpg" # Make sure you have a 'reference.jpg' in the same folder
-image_path = "reference.png" # Make sure you have a 'reference.jpg' in the same folder
+# Store user state: {chat_id: {"image_path": "...", "step": "wait_prompt"}}
+user_data = {}
 
+def get_headers():
+    return {
+        "Authorization": f"Bearer {NSFW_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
+def encode_image_to_base64(file_path):
+    with open(file_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-def generate_image():
-    if not os.path.exists(image_path):
-        print("❌ Error: reference.jpg not found!")
-        return
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "Send me a reference image to start undressing or video generation.")
 
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
     try:
-        # Encode image to Base64
-        b64_image = encode_image(image_path)
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Save image temporarily
+        filename = f"{message.chat.id}.jpg"
+        with open(filename, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        user_data[message.chat.id] = {
+            "image_path": filename,
+            "step": "prompt"
+        }
+        
+        bot.reply_to(message, "Image received! Now send me a prompt (e.g., 'undress, realistic, 8k') or type '/generate' for default.")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
 
-        # Payload for NSFW Router API
-        # Most APIs accept 'image' as base64 and 'prompt' as text
+@bot.message_handler(func=lambda message: message.chat.id in user_data and user_data[message.chat.id]["step"] == "prompt")
+def handle_prompt(message):
+    chat_id = message.chat.id
+    if message.text == '/generate':
+        prompt = "undress, realistic, high quality, 8k, masterpiece"
+    else:
+        prompt = message.text
+    
+    user_data[chat_id]["prompt"] = prompt
+    generate_and_send(chat_id)
+
+def generate_and_send(chat_id):
+    bot.send_chat_action(chat_id, 'typing')
+    bot.send_message(chat_id, "Generating... this might take a minute.")
+    
+    data = user_data[chat_id]
+    img_path = data["image_path"]
+    prompt = data.get("prompt", "undress, realistic")
+    
+    try:
+        # Encode image
+        b64_image = encode_image_to_base64(img_path)
+        
+        # Payload for Img2Img (Most likely endpoint for NSFW Router)
         payload = {
             "image": b64_image,
-            "prompt": "masterpiece, best quality, 8k, ultra-detailed, undress, realistic",
-            "negative_prompt": "low quality, blurry, distorted",
+            "prompt": prompt,
+            "negative_prompt": "low quality, blurry, distorted, bad anatomy, extra limbs",
             "steps": 30,
             "cfg_scale": 7.5,
             "width": 1024,
             "height": 1024,
-            "model": "sdxl" # Try "sdxl", "flux", or "sd15" if this fails
+            "model": "sdxl" # Try "flux" or "sdxl" if this fails
         }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}"
-        }
-
-        # Try the most common endpoint
-        url = f"{BASE_URL}/generate"
         
-        print(f"🚀 Sending request to: {url}")
-        response = requests.post(url, json=payload, headers=headers)
-
+        # Try Img2Img Endpoint first
+        try:
+            url = f"{BASE_URL}/img2img"
+            response = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+        except:
+            # Fallback to simple generate if img2img fails
+            url = f"{BASE_URL}/generate"
+            response = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+            
         if response.status_code == 200:
             result = response.json()
+            # Extract image URL from response (Key might vary)
+            img_url = result.get("url") or result.get("image") or result.get("images")[0] if "images" in result else None
             
-            # Extract image URL or Base64 from response
-            # This depends on the API response structure
-            if "url" in result:
-                img_url = result["url"]
-                print(f"✅ Success! Image URL: {img_url}")
-                # Download image
-                with open("generated_result.jpg", "wb") as f:
-                    f.write(requests.get(img_url).content)
-                print("💾 Image saved as generated_result.jpg")
-            elif "image" in result:
-                img_data = result["image"]
-                with open("generated_result.jpg", "wb") as f:
-                    f.write(base64.b64decode(img_data))
-                print("✅ Success! Image saved as generated_result.jpg")
+            if img_url:
+                bot.send_photo(chat_id, img_url, caption=f"Generated:\n{prompt}")
             else:
-                print("⚠️ Success but unknown response structure:", result)
+                bot.send_message(chat_id, "Success but no image URL found in response. Check API docs.")
         else:
-            print(f"❌ Error {response.status_code}: {response.text}")
-
+            bot.send_message(chat_id, f"API Error: {response.status_code} - {response.text}")
+            
     except Exception as e:
-        print(f"❌ Exception: {e}")
+        bot.send_message(chat_id, f"Error: {str(e)}")
+    finally:
+        # Cleanup
+        if os.path.exists(img_path):
+            os.remove(img_path)
 
+# Run
 if __name__ == "__main__":
-    generate_image()
+    bot.infinity_polling()
