@@ -10,6 +10,7 @@ import logging
 # These keys will be injected via GitHub Secrets
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NSFW_API_KEY = os.getenv("NSFWROUTER_API_KEY")
+# Adjust this base URL if your API docs say otherwise
 BASE_URL = os.getenv("NSFW_BASE_URL", "https://nsfwrouter.xyz/api/v1")
 
 # Enable logging
@@ -18,8 +19,7 @@ logging.basicConfig(level=logging.INFO)
 # Initialize Bot
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# In-memory storage for user state (Simple and fast)
-# Structure: {chat_id: {"image_path": "path", "step": "prompt" or "video"}}
+# In-memory storage for user state
 user_data = {}
 
 def get_api_headers():
@@ -31,8 +31,12 @@ def get_api_headers():
 
 def encode_image_to_base64(file_path):
     """Encode image file to base64 string"""
-    with open(file_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+    try:
+        with open(file_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error encoding image: {e}")
+        return None
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -50,6 +54,7 @@ def handle_photo(message):
         downloaded_file = bot.download_file(file_info.file_path)
         
         # Save image temporarily
+        # Use a unique name to avoid conflicts
         filename = f"{message.chat.id}_{int(time.time())}.jpg"
         with open(filename, 'wb') as new_file:
             new_file.write(downloaded_file)
@@ -88,26 +93,30 @@ def generate_and_send(chat_id):
     prompt = data.get("prompt", "undress, realistic")
     
     try:
-        # Encode image
+        # Encode image to Base64 (More reliable than file objects)
         b64_image = encode_image_to_base64(img_path)
         
-        # Payload for Img2Img (Most likely endpoint for NSFW Router)
+        if not b64_image:
+            bot.send_message(chat_id, "❌ Error: Could not read image file.")
+            return
+
+        # Payload for Img2Img
         payload = {
-            "image": b64_image,
+            "image": b64_image,  # Sending as base64 string
             "prompt": prompt,
             "negative_prompt": "low quality, blurry, distorted, bad anatomy, extra limbs",
             "steps": 30,
             "cfg_scale": 7.5,
             "width": 1024,
             "height": 1024,
-            "model": "sdxl" # Try "flux" or "sdxl" if this fails
+            "model": "sdxl" 
         }
         
         # Try Img2Img Endpoint first
         try:
             url = f"{BASE_URL}/img2img"
             response = requests.post(url, json=payload, headers=get_api_headers(), timeout=120)
-        except:
+        except Exception:
             # Fallback to simple generate if img2img fails
             url = f"{BASE_URL}/generate"
             response = requests.post(url, json=payload, headers=get_api_headers(), timeout=120)
@@ -130,6 +139,9 @@ def generate_and_send(chat_id):
         # Cleanup temp file
         if os.path.exists(img_path):
             os.remove(img_path)
+        # Clear user data for this chat
+        if chat_id in user_data:
+            del user_data[chat_id]
 
 # Run the bot
 if __name__ == "__main__":
