@@ -1,177 +1,78 @@
-import os
 import requests
-import telebot
-from telebot import types
-import time
-import uuid
+import base64
+import os
 
-# Configuration
-API_KEY = os.getenv("NSFWROUTER_API_KEY", "YOUR_GENERATED_API_KEY_HERE")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+# 1. PASTE YOUR API KEY HERE
+API_KEY = "YOUR_API_KEY_HERE"  # Replace with the key from your screenshot
 
-# Initialize Bot
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# 2. SET THE BASE URL
+# Usually it's just the domain + /api/v1
+BASE_URL = "https://nothrotting.xyz/api/v1" # Adjust if the domain is different
 
-# NSFWRouter API Base URL (Assumed based on typical structures)
-# Agar nsfwrouter.xyz ka specific endpoint alag hai, toh yahan change karein.
-BASE_URL = "https://nsfwrouter.xyz/api"  # Example endpoint
+# 3. Prepare the Image
+image_path = "reference.jpg" # Make sure you have a 'reference.jpg' in the same folder
 
-# Global storage for user context
-user_images = {}
-user_prompts = {}
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
-def get_api_headers():
-    """Headers with API Key"""
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(types.KeyboardButton("Generate Image", request_contact=False))
-    bot.send_message(message.chat.id, "Welcome! Send me a reference image to undress or generate a video.", reply_markup=kb)
-
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    try:
-        # Get file info
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        
-        # Save temporarily
-        filename = f"{uuid.uuid4().hex}.jpg"
-        with open(filename, 'wb') as new_file:
-            new_file.write(downloaded_file)
-        
-        # Store user context
-        user_images[message.chat.id] = filename
-        
-        # Send prompt for customization (optional) or direct generation
-        markup = types.ReplyKeyboardMarkup(row_width=2)
-        markup.add(types.KeyboardButton("Undress"), types.KeyboardButton("Generate Video"))
-        markup.add(types.KeyboardButton("Cancel"))
-        
-        bot.send_message(message.chat.id, "Image received! Choose an action:", reply_markup=markup)
-        
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Error: {str(e)}")
-
-@bot.message_handler(func=lambda m: m.text in ["Undress", "Generate Video"])
-def handle_action(message):
-    action = message.text
-    chat_id = message.chat.id
-    
-    if chat_id not in user_images:
-        bot.send_message(chat_id, "Please send an image first.")
+def generate_image():
+    if not os.path.exists(image_path):
+        print("❌ Error: reference.jpg not found!")
         return
 
-    image_path = user_images[chat_id]
-    
-    if action == "Undress":
-        generate_undress(chat_id, image_path)
-    elif action == "Generate Video":
-        generate_video(chat_id, image_path)
-    elif action == "Cancel":
-        if chat_id in user_images:
-            os.remove(user_images[chat_id])
-            del user_images[chat_id]
-        bot.send_message(chat_id, "Cancelled.")
-
-def generate_undress(chat_id, image_path):
-    """
-    Calls NSFWRouter API for image-to-image undressing.
-    Adjust payload based on actual API docs of nsfwrouter.xyz
-    """
-    bot.send_chat_action(chat_id, "typing")
-    bot.send_message(chat_id, "Generating high-quality undressed image... (HQ HD)")
-    
     try:
-        # Example payload structure (Adjust according to actual API)
-        # Most APIs expect: image, prompt, model_id, strength, etc.
+        # Encode image to Base64
+        b64_image = encode_image(image_path)
+
+        # Payload for NSFW Router API
+        # Most APIs accept 'image' as base64 and 'prompt' as text
         payload = {
-            "image": open(image_path, "rb"),
-            "prompt": "masterpiece, best quality, 8k, ultra-detailed, realistic skin, undressed, nude",
-            "negative_prompt": "low quality, blurry, distorted, extra limbs, bad anatomy",
+            "image": b64_image,
+            "prompt": "masterpiece, best quality, 8k, ultra-detailed, undress, realistic",
+            "negative_prompt": "low quality, blurry, distorted",
             "steps": 30,
             "cfg_scale": 7.5,
-            "model": "sd_xl_base_1.0"  # Example model
+            "width": 1024,
+            "height": 1024,
+            "model": "sdxl" # Try "sdxl", "flux", or "sd15" if this fails
         }
-        
-        # If API expects JSON with base64 or multipart form-data
-        # Here we assume multipart/form-data for image upload
-        
-        response = requests.post(
-            f"{BASE_URL}/generate",  # Adjust endpoint
-            headers=get_api_headers(),
-            files={"image": open(image_path, "rb")},
-            data=payload  # Or json=payload if it's JSON
-        )
-        
-        if response.status_code == 200:
-            # Assume API returns JSON with 'url' or 'image' field
-            result = response.json()
-            img_url = result.get("url") or result.get("image")  # Adjust key as per actual API response
-            
-            if img_url:
-                bot.send_photo(chat_id, img_url, caption="Here is your HQ undressed image!")
-            else:
-                # If API returns base64 or file
-                bot.send_photo(chat_id, open(image_path, "rb"), caption="Generated image (Fallback)")
-        else:
-            bot.send_message(chat_id, f"Error: {response.status_code} - {response.text}")
-            
-    except Exception as e:
-        bot.send_message(chat_id, f"API Error: {str(e)}")
-    finally:
-        # Cleanup temp file
-        if os.path.exists(image_path):
-            os.remove(image_path)
 
-def generate_video(chat_id, image_path):
-    """
-    Generates a 5-10 second video from the reference image.
-    Uses NSFWRouter's video generation endpoint or external API if needed.
-    """
-    bot.send_chat_action(chat_id, "typing")
-    bot.send_message(chat_id, "Generating video (5-10 seconds)... This may take a minute.")
-    
-    try:
-        # Example payload for video generation
-        payload = {
-            "image": open(image_path, "rb"),
-            "prompt": "smooth motion, realistic movement, high quality, 8k",
-            "duration": 5,  # Requesting 5-10 seconds
-            "fps": 24,
-            "model": "sdxl_video_1.0"  # Example model
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}"
         }
+
+        # Try the most common endpoint
+        url = f"{BASE_URL}/generate"
         
-        response = requests.post(
-            f"{BASE_URL}/generate-video",  # Adjust endpoint
-            headers=get_api_headers(),
-            files={"image": open(image_path, "rb")},
-            data=payload
-        )
-        
+        print(f"🚀 Sending request to: {url}")
+        response = requests.post(url, json=payload, headers=headers)
+
         if response.status_code == 200:
             result = response.json()
-            video_url = result.get("url") or result.get("video")  # Adjust key
             
-            if video_url:
-                bot.send_video(chat_id, video_url, caption="Here is your generated video!")
+            # Extract image URL or Base64 from response
+            # This depends on the API response structure
+            if "url" in result:
+                img_url = result["url"]
+                print(f"✅ Success! Image URL: {img_url}")
+                # Download image
+                with open("generated_result.jpg", "wb") as f:
+                    f.write(requests.get(img_url).content)
+                print("💾 Image saved as generated_result.jpg")
+            elif "image" in result:
+                img_data = result["image"]
+                with open("generated_result.jpg", "wb") as f:
+                    f.write(base64.b64decode(img_data))
+                print("✅ Success! Image saved as generated_result.jpg")
             else:
-                bot.send_message(chat_id, "Video generated but URL not found in response.")
+                print("⚠️ Success but unknown response structure:", result)
         else:
-            bot.send_message(chat_id, f"Error: {response.status_code} - {response.text}")
-            
-    except Exception as e:
-        bot.send_message(chat_id, f"API Error: {str(e)}")
-    finally:
-        if os.path.exists(image_path):
-            os.remove(image_path)
+            print(f"❌ Error {response.status_code}: {response.text}")
 
-# Run the bot
+    except Exception as e:
+        print(f"❌ Exception: {e}")
+
 if __name__ == "__main__":
-    print("Bot is running...")
-    bot.infinity_polling()
+    generate_image()
