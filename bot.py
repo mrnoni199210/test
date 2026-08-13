@@ -3,7 +3,7 @@ import base64
 import os
 
 # 1. PASTE YOUR API KEY HERE
-API_KEY = "YOUR_API_KEY_HERE"  # Replace with the key from your screenshot
+API_KEY = "sk-b6a8c4d7fe883e27726a83099867ae220d02828df04354b0"  # Replace with the key from your screenshot
 
 # 2. SET THE BASE URL
 # Usually it's just the domain + /api/v1
@@ -11,6 +11,8 @@ BASE_URL = "https://nothrotting.xyz/api/v1" # Adjust if the domain is different
 
 # 3. Prepare the Image
 image_path = "reference.jpg" # Make sure you have a 'reference.jpg' in the same folder
+image_path = "reference.png" # Make sure you have a 'reference.jpg' in the same folder
+
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
