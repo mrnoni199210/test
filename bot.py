@@ -3,57 +3,75 @@ import requests
 import telebot
 from telebot import types
 import base64
+import time
+import logging
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# These keys will be injected via GitHub Secrets
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NSFW_API_KEY = os.getenv("NSFWROUTER_API_KEY")
-# Base URL: Usually just the domain without /console
-BASE_URL = "https://nsfwrouter.xyz/api/v1" 
+BASE_URL = os.getenv("NSFW_BASE_URL", "https://nsfwrouter.xyz/api/v1")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Enable logging
+logging.basicConfig(level=logging.INFO)
 
-# Store user state: {chat_id: {"image_path": "...", "step": "wait_prompt"}}
+# Initialize Bot
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# In-memory storage for user state (Simple and fast)
+# Structure: {chat_id: {"image_path": "path", "step": "prompt" or "video"}}
 user_data = {}
 
-def get_headers():
+def get_api_headers():
+    """Return headers with Authorization"""
     return {
         "Authorization": f"Bearer {NSFW_API_KEY}",
         "Content-Type": "application/json"
     }
 
 def encode_image_to_base64(file_path):
+    """Encode image file to base64 string"""
     with open(file_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "Send me a reference image to start undressing or video generation.")
+    """Welcome message"""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("Start Generating"))
+    bot.reply_to(message, "Welcome! Send me a reference image to start.", reply_markup=kb)
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
+    """Handle incoming photo"""
     try:
+        # Get file info
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
         # Save image temporarily
-        filename = f"{message.chat.id}.jpg"
+        filename = f"{message.chat.id}_{int(time.time())}.jpg"
         with open(filename, 'wb') as new_file:
             new_file.write(downloaded_file)
             
+        # Store user data
         user_data[message.chat.id] = {
             "image_path": filename,
             "step": "prompt"
         }
         
-        bot.reply_to(message, "Image received! Now send me a prompt (e.g., 'undress, realistic, 8k') or type '/generate' for default.")
+        bot.reply_to(message, "✅ Image received! Now send me a prompt (e.g., 'undress, realistic, 8k') or type `/generate` for default.")
+        
     except Exception as e:
-        bot.reply_to(message, f"Error: {e}")
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 @bot.message_handler(func=lambda message: message.chat.id in user_data and user_data[message.chat.id]["step"] == "prompt")
 def handle_prompt(message):
+    """Handle user prompt"""
     chat_id = message.chat.id
+    
     if message.text == '/generate':
-        prompt = "undress, realistic, high quality, 8k, masterpiece"
+        prompt = "undress, realistic, high quality, 8k, masterpiece, best quality"
     else:
         prompt = message.text
     
@@ -61,8 +79,9 @@ def handle_prompt(message):
     generate_and_send(chat_id)
 
 def generate_and_send(chat_id):
+    """Main generation logic"""
     bot.send_chat_action(chat_id, 'typing')
-    bot.send_message(chat_id, "Generating... this might take a minute.")
+    bot.send_message(chat_id, "⏳ Generating... This might take a minute.")
     
     data = user_data[chat_id]
     img_path = data["image_path"]
@@ -87,11 +106,11 @@ def generate_and_send(chat_id):
         # Try Img2Img Endpoint first
         try:
             url = f"{BASE_URL}/img2img"
-            response = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+            response = requests.post(url, json=payload, headers=get_api_headers(), timeout=120)
         except:
             # Fallback to simple generate if img2img fails
             url = f"{BASE_URL}/generate"
-            response = requests.post(url, json=payload, headers=get_headers(), timeout=120)
+            response = requests.post(url, json=payload, headers=get_api_headers(), timeout=120)
             
         if response.status_code == 200:
             result = response.json()
@@ -101,17 +120,18 @@ def generate_and_send(chat_id):
             if img_url:
                 bot.send_photo(chat_id, img_url, caption=f"Generated:\n{prompt}")
             else:
-                bot.send_message(chat_id, "Success but no image URL found in response. Check API docs.")
+                bot.send_message(chat_id, "✅ Success but no image URL found in response. Check API docs.")
         else:
-            bot.send_message(chat_id, f"API Error: {response.status_code} - {response.text}")
+            bot.send_message(chat_id, f"❌ API Error: {response.status_code} - {response.text}")
             
     except Exception as e:
-        bot.send_message(chat_id, f"Error: {str(e)}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)}")
     finally:
-        # Cleanup
+        # Cleanup temp file
         if os.path.exists(img_path):
             os.remove(img_path)
 
-# Run
+# Run the bot
 if __name__ == "__main__":
+    print("🤖 Bot is running...")
     bot.infinity_polling()
